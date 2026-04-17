@@ -1,0 +1,57 @@
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+pip-wheel-metadata/
+
+# ─── Django ───────────────────────────────────────────────────────────────────
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+staticfiles/
+media/
+
+# ─── Environment & Secrets ────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ─── Node / Hardhat ───────────────────────────────────────────────────────────
+node_modules/
+blockchain/node_modules/
+blockchain/cache/
+blockchain/artifacts/
+package-lock.json
+yarn.lock
+.npm/
+
+# ─── Docker ───────────────────────────────────────────────────────────────────
+# (keep Dockerfile and docker-compose.yml, ignore runtime data)
+
+# ─── IDE / Editor ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ─── Misc ─────────────────────────────────────────────────────────────────────
+*.docx
+*.tmp
+setup.txt

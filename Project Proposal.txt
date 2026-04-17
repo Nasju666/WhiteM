@@ -1,0 +1,154 @@
+Opening Story (Emotional Hook – 1 minute)
+
+Last year, our friend Kian wanted to buy a second-hand digital camera worth ₱3,000.
+
+He found a seller on Instagram. The post looked legitimate. The photos were clear. The conversation felt normal.
+He saved up his allowance. He trusted the seller.
+So he sent the payment.
+
+Minutes later — he was blocked.
+The seller disappeared. The account vanished.
+And just like that, ₱3,000 was gone.
+
+(Pause.)
+
+Unfortunately, Kian’s story is not unique.
+Every day, students and online buyers experience scams when purchasing through social media platforms.
+
+🔴 Problem Statement (1 minute)
+
+The problem is simple:
+Online trading through social media lacks protection.
+
+There is:
+- No escrow system
+- No verified seller identity
+- No structured dispute resolution
+- No accountability
+
+Because of this, trust in online transactions decreases.
+And when trust decreases, digital economic participation also decreases.
+Many people hesitate to sell or buy online because they fear being scammed.
+
+🔵 Introduction of Solution (30 seconds)
+
+To address this, we propose White Market Trading Hub — a secure digital trading platform built with Django and integrated with blockchain-based escrow protection.
+
+Our system creates a safer environment for buying and selling both physical and digital goods.
+
+🟣 System Overview (2 minutes)
+
+📌 What Our Platform Offers
+
+1️⃣ Verified Sellers
+- Sellers must upload a valid ID
+- Admin reviews and approves KYC
+- Verified badge appears on seller profile
+This discourages fake accounts.
+
+2️⃣ Wallet-Based Authentication
+- Users log in using crypto wallets such as MetaMask.
+- No passwords stored
+- Digital signature authentication
+- Secure identity verification
+The system never stores private keys.
+
+3️⃣ Blockchain-Based Escrow
+Here’s how transactions work:
+- Buyer selects an item
+- Buyer sends payment to escrow
+- Funds are locked in a smart contract
+- Seller delivers item
+- Buyer confirms receipt
+- Funds released automatically
+
+If dispute is triggered:
+- Funds are frozen
+- Case moves to dispute resolution
+
+4️⃣ Dispute Evaluation System
+If buyer claims scam:
+- Buyer submits: Reason, Screenshot proof, Description
+- Seller submits: Counter evidence
+- Admin reviews: Chat logs, Delivery proof, Transaction hash
+
+Admin can:
+- Release funds to seller
+- Refund buyer
+- Do a partial settlement
+This protects BOTH buyer and seller.
+
+5️⃣ Admin Dashboard
+Using Django Admin, staff can:
+- Approve seller verification
+- Monitor transactions
+- Handle disputes
+- Suspend suspicious accounts
+- View transaction history
+
+🟡 Technical Architecture (1 minute)
+
+What we use:
+
+Backend:
+- Python
+- Django Framework
+- Django REST Framework
+
+Database:
+- PostgreSQL
+
+Blockchain:
+- Ethereum Testnet
+- Solidity Smart Contract
+
+Wallet Integration:
+- MetaMask API
+
+Web3 Integration:
+- web3.py
+
+Django handles: Business logic, Dispute management, Admin system
+Blockchain handles: Escrow fund holding, Transaction immutability, Timestamp verification
+
+🟠 Why This Is Important
+
+- Reduces online scams
+- Encourages safe digital trading
+- Protects students and small sellers
+- Builds trust in the online economy
+- Teaches responsible digital commerce
+
+🗓 Development Timeline (3–4 Weeks)
+
+Since your allotted time is 1 month (3–4 weeks), we’ll compress the development into focused phases while keeping it realistic for a Django-based MVP.
+
+📅 Proposed Development Schedule (4 Weeks)
+
+Week 1: Requirement finalization, system planning, database design, Django project setup
+Week 2: User authentication (wallet login simulation), seller verification (KYC upload), item listing module
+Week 3: Transaction model, escrow logic (backend simulation), dispute management system
+Week 4: Admin dashboard configuration, system integration, testing & debugging, documentation
+
+🎯 Visual Phase Breakdown
+
+Phase 1: Planning & Setup (Week 1)
+- Finalize system features
+- Design database models
+- Setup Django project structure
+
+Phase 2: Core Marketplace Development (Week 2)
+- User roles (buyer/seller/admin)
+- Seller ID verification upload
+- Item posting & marketplace interface
+
+Phase 3: Escrow & Dispute Logic (Week 3)
+- Transaction system
+- Escrow simulation logic
+- Dispute filing and evidence upload
+
+Phase 4: Admin, Testing & Finalization (Week 4)
+- Django Admin customization
+- Full system integration
+- Bug fixing
+- Documentation & preparation for presentation

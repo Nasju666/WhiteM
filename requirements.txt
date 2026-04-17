@@ -1,0 +1,27 @@
+# Django
+Django==6.0.3
+djangorestframework==3.16.1
+djangorestframework_simplejwt==5.5.1
+django-cors-headers==4.9.0
+
+# Database
+psycopg2-binary==2.9.11
+
+# Web3
+web3==7.14.1
+eth-account==0.13.7
+
+# Auth
+PyJWT==2.11.0
+
+# Environment
+python-dotenv==1.2.2
+
+# Production server
+gunicorn==23.0.0
+
+# Security
+django-ratelimit==4.1.0
+
+# Image handling (for tests)
+Pillow>=10.0
