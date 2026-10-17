@@ -55,3 +55,8 @@ Thumbs.db
 *.docx
 *.tmp
 setup.txt
+
+# ─── Local-only docs (not pushed) ─────────────────────────────────────────────
+README.md
+SETUP.md
+MAINNET_DEPLOYMENT.md
