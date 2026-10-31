@@ -1,3 +1,7 @@
+import logging
+import re
+from datetime import timedelta
+
 from django.db.models import Q, Sum, Count
 from django.utils import timezone
 from rest_framework import filters, generics, permissions, status
@@ -371,9 +375,20 @@ class OrderStatusView(APIView):
                 {"detail": "Only the seller can perform this action."},
                 status=status.HTTP_403_FORBIDDEN,
             )
+        # Money-moving states are only set after the backend checks the chain.
+        if new_status in ("paid", "completed"):
+            return Response(
+                {"detail": f"'{new_status}' is set automatically after the on-chain "
+                           "transaction is verified (POST /escrow/verify/ or /escrow/sync/)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if new_status == "cancelled" and order.escrow_id is not None:
+            return Response(
+                {"detail": "This order is funded. The seller must refund the escrow to cancel it."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         tracking = serializer.validated_data.get("tracking_number")
-        tx_hash = serializer.validated_data.get("tx_hash")
-        escrow_id = serializer.validated_data.get("escrow_id")
 
         try:
             order.transition_status(new_status)
@@ -383,131 +398,306 @@ class OrderStatusView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        update_fields = []
         if tracking:
             order.tracking_number = tracking
-            update_fields.append("tracking_number")
-        if tx_hash:
-            order.tx_hash = tx_hash
-            update_fields.append("tx_hash")
-        if escrow_id is not None:
-            order.escrow_id = escrow_id
-            update_fields.append("escrow_id")
-        if update_fields:
-            order.save(update_fields=update_fields)
+            order.save(update_fields=["tracking_number"])
 
         return Response(OrderSerializer(order).data)
 
 
 # ---------------------------------------------------------------------------
-# Phase 5 — Escrow views (Web3 integration)
+# Phase 5 — Escrow views (USDC on Base)
+#
+# The buyer/seller sign transactions in MetaMask. The backend never trusts
+# the browser's word about payments: it reads contract state to verify.
 # ---------------------------------------------------------------------------
+
+_escrow_log = logging.getLogger("core.escrow")
+_TX_HASH_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
+_QUOTE_TTL = timedelta(minutes=30)
+
+
+def _get_order(pk):
+    try:
+        return Order.objects.select_related("product__seller", "buyer").get(pk=pk)
+    except Order.DoesNotExist:
+        return None
+
+
+class EscrowConfigView(APIView):
+    """
+    GET /api/escrow/config/
+    Public network/contract info and the current PHP-per-USDC rate.
+    """
+
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        from .web3_service import get_public_config
+        return Response(get_public_config())
 
 
 class EscrowCreateView(APIView):
     """
     POST /api/orders/<id>/escrow/create/
-    Returns an unsigned transaction for the buyer to create an on-chain escrow.
+    Quotes the order in USDC and returns the two calls the buyer signs:
+    USDC approve() and Escrow createEscrow().
     """
 
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, pk):
-        try:
-            order = Order.objects.select_related("product__seller", "buyer").get(pk=pk)
-        except Order.DoesNotExist:
+        order = _get_order(pk)
+        if order is None:
             return Response({"detail": "Order not found."}, status=status.HTTP_404_NOT_FOUND)
-
         if order.buyer != request.user:
             return Response({"detail": "Only the buyer can create an escrow."}, status=status.HTTP_403_FORBIDDEN)
-
         if order.escrow_id is not None:
             return Response({"detail": "Escrow already exists for this order."}, status=status.HTTP_400_BAD_REQUEST)
+        if order.status != Order.Status.PENDING:
+            return Response({"detail": "Only pending orders can be paid."}, status=status.HTTP_400_BAD_REQUEST)
 
-        from .web3_service import build_create_escrow_tx
-        from web3 import Web3
-        from decimal import Decimal
+        from . import web3_service as w3s
 
-        # ₱1 = 0.00001 ETH (must match frontend PHP_TO_ETH_RATE in escrow.js)
-        PHP_TO_ETH_RATE = Decimal("0.00001")
-        amount_eth = Decimal(str(order.total_price)) * PHP_TO_ETH_RATE
-        amount_wei = Web3.to_wei(amount_eth, "ether")
         try:
-            tx = build_create_escrow_tx(
-                buyer_address=order.buyer.wallet_address,
+            # Reuse a recent quote so the amount doesn't change between retries.
+            now = timezone.now()
+            fresh = order.escrow_quoted_at and now - order.escrow_quoted_at < _QUOTE_TTL
+            if not (fresh and order.escrow_amount_units):
+                rate = w3s.get_php_per_usdc()
+                order.escrow_php_rate = rate
+                order.escrow_amount_units = w3s.php_to_usdc_units(order.total_price)
+                order.escrow_quoted_at = now
+                order.save(update_fields=["escrow_php_rate", "escrow_amount_units", "escrow_quoted_at", "updated_at"])
+
+            calls = w3s.build_create_escrow_calls(
+                order_id=order.id,
                 seller_address=order.product.seller.wallet_address,
-                amount_wei=amount_wei,
+                amount_units=order.escrow_amount_units,
             )
+            config = w3s.get_public_config()
+        except Exception as exc:
+            _escrow_log.exception("Escrow quote failed for order %s", order.id)
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        return Response({
+            "order_id": order.id,
+            "amount_units": str(order.escrow_amount_units),
+            "amount_usdc": w3s.units_to_usdc(order.escrow_amount_units),
+            "php_per_usdc": str(order.escrow_php_rate),
+            "calls": calls,
+            "config": config,
+        })
+
+
+class EscrowVerifyView(APIView):
+    """
+    POST /api/orders/<id>/escrow/verify/   body: { "tx_hash": "0x..." }
+    Checks the contract for this order's escrow and, if it matches, marks the order paid.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk):
+        order = _get_order(pk)
+        if order is None:
+            return Response({"detail": "Order not found."}, status=status.HTTP_404_NOT_FOUND)
+        if order.buyer != request.user:
+            return Response({"detail": "Only the buyer can verify payment."}, status=status.HTTP_403_FORBIDDEN)
+        if order.escrow_id is not None:
+            return Response(OrderSerializer(order).data)  # already verified (idempotent)
+        if order.status != Order.Status.PENDING or not order.escrow_amount_units:
+            return Response({"detail": "No pending escrow quote for this order."}, status=status.HTTP_400_BAD_REQUEST)
+
+        tx_hash = (request.data.get("tx_hash") or "").strip()
+        if tx_hash and not _TX_HASH_RE.match(tx_hash):
+            return Response({"detail": "Invalid transaction hash."}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .web3_service import EscrowError, verify_escrow_for_order
+
+        try:
+            escrow = verify_escrow_for_order(
+                order_id=order.id,
+                buyer=order.buyer.wallet_address,
+                seller=order.product.seller.wallet_address,
+                min_amount_units=order.escrow_amount_units,
+            )
+        except EscrowError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
-        return Response({"transaction": tx, "order_id": order.id})
+        order.escrow_id = escrow["escrow_id"]
+        order.escrow_amount_units = escrow["amount_units"]
+        if tx_hash:
+            order.tx_hash = tx_hash
+        order.save(update_fields=["escrow_id", "escrow_amount_units", "tx_hash", "updated_at"])
+        order.transition_status(Order.Status.PAID)
+        return Response(OrderSerializer(order).data)
+
+
+class EscrowSyncView(APIView):
+    """
+    POST /api/orders/<id>/escrow/sync/
+    Re-reads the on-chain escrow and updates the order:
+    complete -> completed, refunded -> cancelled.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk):
+        order = _get_order(pk)
+        if order is None:
+            return Response({"detail": "Order not found."}, status=status.HTTP_404_NOT_FOUND)
+        if order.buyer != request.user and order.product.seller != request.user:
+            return Response({"detail": "Not authorized."}, status=status.HTTP_403_FORBIDDEN)
+        if order.escrow_id is None:
+            return Response({"detail": "No escrow linked to this order."}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .web3_service import get_escrow_status
+
+        try:
+            escrow = get_escrow_status(order.escrow_id)
+        except Exception as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        if not escrow_matches_order(order, escrow):
+            return Response(
+                {"detail": "On-chain escrow does not belong to this order (old contract?)."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        apply_escrow_state(order, escrow["status"])
+        data = OrderSerializer(order).data
+        data["escrow"] = escrow
+        return Response(data)
+
+
+def escrow_matches_order(order, escrow):
+    """True if the on-chain escrow record really belongs to this order."""
+    return (
+        escrow.get("order_id") == order.id
+        and (escrow.get("buyer") or "").lower() == order.buyer.wallet_address.lower()
+    )
+
+
+def apply_escrow_state(order, chain_status):
+    """Mirror a settled on-chain escrow into the order's status."""
+    target = {
+        "complete": Order.Status.COMPLETED,
+        "refunded": Order.Status.CANCELLED,
+    }.get(chain_status)
+    if target and order.status != target:
+        order.status = target
+        order.save(update_fields=["status", "updated_at"])
 
 
 class EscrowConfirmView(APIView):
     """
     POST /api/orders/<id>/escrow/confirm/
-    Returns unsigned tx for buyer to confirm delivery (release funds to seller).
+    Returns the confirmDelivery() call for the buyer to sign (releases funds to seller).
     """
 
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, pk):
-        try:
-            order = Order.objects.select_related("product__seller", "buyer").get(pk=pk)
-        except Order.DoesNotExist:
+        order = _get_order(pk)
+        if order is None:
             return Response({"detail": "Order not found."}, status=status.HTTP_404_NOT_FOUND)
-
         if order.buyer != request.user:
             return Response({"detail": "Only the buyer can confirm delivery."}, status=status.HTTP_403_FORBIDDEN)
-
         if order.escrow_id is None:
             return Response({"detail": "No escrow linked to this order."}, status=status.HTTP_400_BAD_REQUEST)
 
-        from .web3_service import build_confirm_delivery_tx
+        from .web3_service import build_confirm_delivery_call, get_public_config
 
         try:
-            tx = build_confirm_delivery_tx(
-                buyer_address=order.buyer.wallet_address,
-                escrow_id=order.escrow_id,
-            )
+            tx = build_confirm_delivery_call(order.escrow_id)
+            config = get_public_config()
         except Exception as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
-        return Response({"transaction": tx, "order_id": order.id})
+        return Response({"transaction": tx, "config": config, "order_id": order.id})
+
+
+class EscrowRefundView(APIView):
+    """
+    POST /api/orders/<id>/escrow/refund/
+    Returns the refundBuyer() call for the seller to sign (cancels a funded order).
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk):
+        order = _get_order(pk)
+        if order is None:
+            return Response({"detail": "Order not found."}, status=status.HTTP_404_NOT_FOUND)
+        if order.product.seller != request.user:
+            return Response({"detail": "Only the seller can refund."}, status=status.HTTP_403_FORBIDDEN)
+        if order.escrow_id is None:
+            return Response({"detail": "No escrow linked to this order."}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .web3_service import build_refund_call, get_public_config
+
+        try:
+            tx = build_refund_call(order.escrow_id)
+            config = get_public_config()
+        except Exception as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        return Response({"transaction": tx, "config": config, "order_id": order.id})
 
 
 class EscrowDisputeView(APIView):
     """
     POST /api/orders/<id>/escrow/dispute/
-    Returns unsigned tx for buyer or seller to raise a dispute.
+    Returns the disputeEscrow() call for the buyer or seller to sign.
+    (Opening a dispute through /dispute/ also freezes the escrow server-side.)
     """
 
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, pk):
-        try:
-            order = Order.objects.select_related("product__seller", "buyer").get(pk=pk)
-        except Order.DoesNotExist:
+        order = _get_order(pk)
+        if order is None:
             return Response({"detail": "Order not found."}, status=status.HTTP_404_NOT_FOUND)
-
         if order.buyer != request.user and order.product.seller != request.user:
             return Response({"detail": "Not authorized."}, status=status.HTTP_403_FORBIDDEN)
-
         if order.escrow_id is None:
             return Response({"detail": "No escrow linked to this order."}, status=status.HTTP_400_BAD_REQUEST)
 
-        from .web3_service import build_dispute_tx
+        from .web3_service import build_dispute_call
 
         try:
-            tx = build_dispute_tx(
-                caller_address=request.user.wallet_address,
-                escrow_id=order.escrow_id,
-            )
+            tx = build_dispute_call(order.escrow_id)
         except Exception as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
         return Response({"transaction": tx, "order_id": order.id})
+
+
+class ReleaseExpiredEscrowsView(APIView):
+    """
+    POST /api/internal/release-expired/   header: Authorization: Bearer <CRON_SECRET>
+    Called hourly by a scheduled job (GitHub Actions) because free hosts have no cron.
+    """
+
+    authentication_classes = []
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = []
+
+    def post(self, request):
+        import hmac
+        from django.conf import settings
+        from .escrow_jobs import release_expired_escrows
+
+        secret = getattr(settings, "CRON_SECRET", "")
+        given = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+        if not secret or not hmac.compare_digest(given.encode(), secret.encode()):
+            return Response({"detail": "Forbidden."}, status=status.HTTP_403_FORBIDDEN)
+
+        result = release_expired_escrows()
+        return Response({k: result[k] for k in ("released", "synced", "errors")})
 
 
 class EscrowStatusView(APIView):
@@ -519,14 +709,11 @@ class EscrowStatusView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, pk):
-        try:
-            order = Order.objects.select_related("product__seller", "buyer").get(pk=pk)
-        except Order.DoesNotExist:
+        order = _get_order(pk)
+        if order is None:
             return Response({"detail": "Order not found."}, status=status.HTTP_404_NOT_FOUND)
-
         if order.buyer != request.user and order.product.seller != request.user:
             return Response({"detail": "Not authorized."}, status=status.HTTP_403_FORBIDDEN)
-
         if order.escrow_id is None:
             return Response({"detail": "No escrow linked to this order."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -587,7 +774,20 @@ class OpenDisputeView(APIView):
         order.status = Order.Status.DISPUTED
         order.save(update_fields=["status", "updated_at"])
 
-        return Response(DisputeSerializer(dispute).data, status=status.HTTP_201_CREATED)
+        data = DisputeSerializer(dispute).data
+
+        # Freeze the on-chain escrow so it can't auto-release while under review.
+        # The platform's arbiter key pays the (sub-cent) gas, not the user.
+        if order.escrow_id is not None:
+            from .web3_service import freeze_escrow_on_chain, get_escrow_status
+            try:
+                if get_escrow_status(order.escrow_id)["status"] == "awaiting_delivery":
+                    freeze_escrow_on_chain(order.escrow_id)
+            except Exception as exc:
+                _escrow_log.error("Could not freeze escrow %s: %s", order.escrow_id, exc)
+                data["warning"] = f"Dispute saved, but freezing the on-chain escrow failed: {exc}"
+
+        return Response(data, status=status.HTTP_201_CREATED)
 
     def get(self, request, pk):
         """GET /api/orders/<id>/dispute/ — view dispute details."""
@@ -665,6 +865,30 @@ class DisputeResolveView(APIView):
 
         resolution = serializer.validated_data["resolution"]
         admin_notes = serializer.validated_data.get("admin_notes", "")
+        order = dispute.order
+
+        # Move the money on-chain first. If that fails, leave the dispute open
+        # so the admin can retry, instead of recording a decision that never paid out.
+        resolve_tx = None
+        if order.escrow_id is not None:
+            from .web3_service import get_escrow_status, resolve_dispute_on_chain
+            try:
+                chain_status = get_escrow_status(order.escrow_id)["status"]
+                if chain_status in ("awaiting_delivery", "disputed"):
+                    resolve_tx = resolve_dispute_on_chain(
+                        order.escrow_id, refund_buyer=(resolution == "refund_buyer")
+                    )
+                else:
+                    _escrow_log.warning(
+                        "Escrow %s already settled on-chain (%s); recording decision only.",
+                        order.escrow_id, chain_status,
+                    )
+            except Exception as exc:
+                _escrow_log.error("On-chain resolution failed for escrow %s: %s", order.escrow_id, exc)
+                return Response(
+                    {"detail": f"On-chain resolution failed, dispute left open: {exc}"},
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
 
         dispute.resolution = resolution
         dispute.admin_notes = admin_notes
@@ -672,29 +896,13 @@ class DisputeResolveView(APIView):
         dispute.resolved_at = timezone.now()
         dispute.save()
 
-        # Update order status to completed (dispute resolved)
-        order = dispute.order
         order.status = Order.Status.COMPLETED
         order.save(update_fields=["status", "updated_at"])
 
-        # Release escrow funds on-chain if an escrow exists for this order
-        escrow_id = order.escrow_id
-        if escrow_id is not None:
-            try:
-                from .web3_service import resolve_dispute_on_chain
-                refund_buyer = (resolution == "refund_buyer")
-                resolve_dispute_on_chain(escrow_id, refund_buyer)
-            except Exception as exc:
-                # DB is already updated; log and surface warning but don't fail
-                import logging
-                logging.getLogger(__name__).error(
-                    "On-chain dispute resolution failed for escrow %s: %s", escrow_id, exc
-                )
-                data = DisputeSerializer(dispute).data
-                data["warning"] = f"DB updated but on-chain call failed: {exc}"
-                return Response(data, status=status.HTTP_207_MULTI_STATUS)
-
-        return Response(DisputeSerializer(dispute).data)
+        data = DisputeSerializer(dispute).data
+        if resolve_tx:
+            data["resolve_tx_hash"] = resolve_tx
+        return Response(data)
 
 
 class AdminDashboardView(APIView):

@@ -7,6 +7,7 @@ import toast from './toast.js';
 import { route, start, navigate } from './router.js';
 import { initScene } from './three-scene.js';
 import { initScrollAnimations } from './animations.js';
+import { loadEscrowConfig } from './escrow.js';
 import {
   landingPage,
   marketplacePage,
@@ -200,6 +201,8 @@ async function init() {
   updatePageMode();
 
   await auth.tryRestore();
+  // Load network config + PHP/USDC rate for price display (non-blocking on failure)
+  await loadEscrowConfig().catch(err => console.warn('Escrow config unavailable:', err.message));
   updateNavbar();
 
   setupWalletDropdown();

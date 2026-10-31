@@ -372,7 +372,8 @@ class OrderTests(TestCase):
         resp = self.client.get("/api/orders/")
         self.assertEqual(len(resp.json()), 1)
 
-    def test_valid_status_transition(self):
+    def test_client_cannot_mark_order_paid(self):
+        """'paid' is only set by the escrow verify endpoint after an on-chain check."""
         self.client.force_authenticate(user=self.buyer)
         resp = self.client.post("/api/orders/", {
             "product": self.product.id,
@@ -380,14 +381,27 @@ class OrderTests(TestCase):
         })
         order_id = resp.json()["id"]
 
-        # pending → paid
         resp = self.client.patch(
             f"/api/orders/{order_id}/status/",
-            {"status": "paid"},
+            {"status": "paid", "escrow_id": 7, "tx_hash": "0xdead"},
             format="json",
         )
+        self.assertEqual(resp.status_code, 400)
+        order = Order.objects.get(pk=order_id)
+        self.assertEqual(order.status, "pending")
+        self.assertIsNone(order.escrow_id)
+
+    def test_buyer_can_cancel_unpaid_order(self):
+        self.client.force_authenticate(user=self.buyer)
+        order_id = self.client.post("/api/orders/", {
+            "product": self.product.id,
+            "quantity": 1,
+        }).json()["id"]
+        resp = self.client.patch(
+            f"/api/orders/{order_id}/status/", {"status": "cancelled"}, format="json"
+        )
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json()["status"], "paid")
+        self.assertEqual(resp.json()["status"], "cancelled")
 
     def test_invalid_status_transition_returns_400(self):
         self.client.force_authenticate(user=self.buyer)
@@ -425,48 +439,79 @@ class OrderTests(TestCase):
 
 
 # ===================================================================
-# Phase 5 — Escrow Endpoint Tests
+# Phase 5 — Escrow Endpoint Tests (USDC)
 # ===================================================================
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
+
+from core.web3_service import EscrowError
+
+_FAKE_CONFIG = {"chain_id": 84532, "chain_id_hex": "0x14a34", "escrow_address": "0xescrow"}
+_FAKE_CALLS = {
+    "approve": {"to": "0xusdc", "data": "0xapprove", "value": "0x0"},
+    "create": {"to": "0xescrow", "data": "0xcreate", "value": "0x0"},
+}
 
 
 class OrderEscrowFieldsTests(TestCase):
-    """Tests for the new escrow fields on Order."""
+    """Tests for the escrow fields on Order."""
 
     def test_order_has_escrow_fields(self):
         seller = _make_seller()
         buyer = _make_buyer()
         product = _make_product(seller)
         order = Order.objects.create(
-            buyer=buyer,
-            product=product,
-            quantity=1,
-            total_price=Decimal("0.5"),
+            buyer=buyer, product=product, quantity=1, total_price=Decimal("0.5"),
         )
         self.assertIsNone(order.escrow_id)
         self.assertEqual(order.tx_hash, "")
+        self.assertIsNone(order.escrow_amount_units)
 
     def test_order_escrow_fields_in_serializer(self):
         seller = _make_seller()
         buyer = _make_buyer()
         product = _make_product(seller)
         order = Order.objects.create(
-            buyer=buyer,
-            product=product,
-            quantity=1,
-            total_price=Decimal("0.5"),
-            escrow_id=42,
-            tx_hash="0xabc123",
+            buyer=buyer, product=product, quantity=1, total_price=Decimal("0.5"),
+            escrow_id=42, tx_hash="0xabc123", escrow_amount_units=1_234_567,
         )
         client = APIClient()
         client.force_authenticate(user=buyer)
-        resp = client.get(f"/api/orders/{order.id}/")
-        data = resp.json()
+        data = client.get(f"/api/orders/{order.id}/").json()
         self.assertEqual(data["escrow_id"], 42)
         self.assertEqual(data["tx_hash"], "0xabc123")
+        self.assertEqual(data["escrow_amount_usdc"], "1.23")
 
 
+class PhpToUsdcTests(TestCase):
+    @patch("core.web3_service.get_php_per_usdc", return_value=Decimal("58"))
+    def test_conversion_to_base_units(self, _rate):
+        from core.web3_service import php_to_usdc_units
+        self.assertEqual(php_to_usdc_units(Decimal("580")), 10_000_000)  # 10 USDC
+        self.assertEqual(php_to_usdc_units(Decimal("1")), 17_241)        # 0.017241 USDC
+
+    @patch("core.web3_service._fetch_live_rate", return_value=None)
+    def test_falls_back_to_env_rate(self, _fetch):
+        from django.core.cache import cache
+        from core.web3_service import get_php_per_usdc
+        cache.clear()
+        with patch.dict("os.environ", {"PHP_PER_USDC": "60.5", "PRICE_FEED": "coingecko"}):
+            self.assertEqual(get_php_per_usdc(), Decimal("60.5"))
+        cache.clear()
+
+    @patch("core.web3_service._fetch_live_rate", return_value=None)
+    def test_no_rate_raises(self, _fetch):
+        from django.core.cache import cache
+        from core.web3_service import get_php_per_usdc
+        cache.clear()
+        with patch.dict("os.environ", {"PHP_PER_USDC": ""}):
+            with self.assertRaises(EscrowError):
+                get_php_per_usdc()
+
+
+@patch("core.web3_service.get_public_config", return_value=_FAKE_CONFIG)
+@patch("core.web3_service.build_create_escrow_calls", return_value=_FAKE_CALLS)
+@patch("core.web3_service.get_php_per_usdc", return_value=Decimal("58"))
 class EscrowCreateEndpointTests(TestCase):
     """Tests for POST /api/orders/<id>/escrow/create/"""
 
@@ -476,39 +521,148 @@ class EscrowCreateEndpointTests(TestCase):
         self.buyer = _make_buyer()
         self.product = _make_product(self.seller)
         self.client.force_authenticate(user=self.buyer)
-        resp = self.client.post("/api/orders/", {
-            "product": self.product.id,
-            "quantity": 1,
-        })
+        resp = self.client.post("/api/orders/", {"product": self.product.id, "quantity": 1})
         self.order_id = resp.json()["id"]
 
-    @patch("core.web3_service.build_create_escrow_tx")
-    def test_returns_unsigned_tx(self, mock_build):
-        mock_build.return_value = {"to": "0xcontract", "value": "0x1"}
+    def test_returns_quote_and_calls(self, _rate, mock_build, _cfg):
         resp = self.client.post(f"/api/orders/{self.order_id}/escrow/create/")
         self.assertEqual(resp.status_code, 200)
-        self.assertIn("transaction", resp.json())
-        mock_build.assert_called_once()
+        body = resp.json()
+        self.assertEqual(body["calls"], _FAKE_CALLS)
+        order = Order.objects.get(pk=self.order_id)
+        expected_units = int((order.total_price / Decimal("58") * 10**6).quantize(Decimal("1")))
+        self.assertEqual(order.escrow_amount_units, expected_units)
+        self.assertEqual(body["amount_units"], str(expected_units))
+        mock_build.assert_called_once_with(
+            order_id=order.id,
+            seller_address=self.seller.wallet_address,
+            amount_units=expected_units,
+        )
 
-    def test_non_buyer_gets_403(self):
+    def test_quote_is_reused_within_ttl(self, mock_rate, _build, _cfg):
+        self.client.post(f"/api/orders/{self.order_id}/escrow/create/")
+        first = Order.objects.get(pk=self.order_id).escrow_amount_units
+        mock_rate.return_value = Decimal("50")
+        self.client.post(f"/api/orders/{self.order_id}/escrow/create/")
+        self.assertEqual(Order.objects.get(pk=self.order_id).escrow_amount_units, first)
+
+    def test_non_buyer_gets_403(self, *_):
         self.client.force_authenticate(user=self.seller)
         resp = self.client.post(f"/api/orders/{self.order_id}/escrow/create/")
         self.assertEqual(resp.status_code, 403)
 
-    @patch("core.web3_service.build_create_escrow_tx")
-    def test_duplicate_escrow_returns_400(self, mock_build):
-        order = Order.objects.get(pk=self.order_id)
-        order.escrow_id = 0
-        order.save()
+    def test_duplicate_escrow_returns_400(self, *_):
+        Order.objects.filter(pk=self.order_id).update(escrow_id=0)
         resp = self.client.post(f"/api/orders/{self.order_id}/escrow/create/")
         self.assertEqual(resp.status_code, 400)
 
-    def test_unauthenticated_gets_401(self):
+    def test_unauthenticated_gets_401(self, *_):
         self.client.force_authenticate(user=None)
         resp = self.client.post(f"/api/orders/{self.order_id}/escrow/create/")
         self.assertEqual(resp.status_code, 401)
 
 
+class EscrowVerifyEndpointTests(TestCase):
+    """Tests for POST /api/orders/<id>/escrow/verify/"""
+
+    TX = "0x" + "ab" * 32
+
+    def setUp(self):
+        self.client = APIClient()
+        self.seller = _make_seller()
+        self.buyer = _make_buyer()
+        self.product = _make_product(self.seller)
+        self.order = Order.objects.create(
+            buyer=self.buyer, product=self.product, quantity=1,
+            total_price=Decimal("580"), escrow_amount_units=10_000_000,
+        )
+        self.client.force_authenticate(user=self.buyer)
+
+    @patch("core.web3_service.verify_escrow_for_order")
+    def test_marks_paid_when_chain_matches(self, mock_verify):
+        mock_verify.return_value = {"escrow_id": 5, "amount_units": 10_000_000}
+        resp = self.client.post(
+            f"/api/orders/{self.order.id}/escrow/verify/", {"tx_hash": self.TX}, format="json"
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, "paid")
+        self.assertEqual(self.order.escrow_id, 5)
+        self.assertEqual(self.order.tx_hash, self.TX)
+        mock_verify.assert_called_once_with(
+            order_id=self.order.id,
+            buyer=self.buyer.wallet_address,
+            seller=self.seller.wallet_address,
+            min_amount_units=10_000_000,
+        )
+
+    @patch("core.web3_service.verify_escrow_for_order", side_effect=EscrowError("underpaid"))
+    def test_rejects_mismatch(self, _verify):
+        resp = self.client.post(f"/api/orders/{self.order.id}/escrow/verify/", {}, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, "pending")
+        self.assertIsNone(self.order.escrow_id)
+
+    def test_rejects_bad_tx_hash(self):
+        resp = self.client.post(
+            f"/api/orders/{self.order.id}/escrow/verify/", {"tx_hash": "nope"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_seller_cannot_verify(self):
+        self.client.force_authenticate(user=self.seller)
+        resp = self.client.post(f"/api/orders/{self.order.id}/escrow/verify/", {}, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+
+class EscrowSyncEndpointTests(TestCase):
+    """Tests for POST /api/orders/<id>/escrow/sync/"""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.seller = _make_seller()
+        self.buyer = _make_buyer()
+        self.product = _make_product(self.seller)
+        self.order = Order.objects.create(
+            buyer=self.buyer, product=self.product, quantity=1,
+            total_price=Decimal("580"), escrow_id=3, status="delivered",
+        )
+
+    def _chain(self, status, order_id=None):
+        return {"status": status, "order_id": order_id or self.order.id,
+                "buyer": self.buyer.wallet_address}
+
+    def test_complete_on_chain_marks_completed(self):
+        self.client.force_authenticate(user=self.buyer)
+        with patch("core.web3_service.get_escrow_status", return_value=self._chain("complete")):
+            resp = self.client.post(f"/api/orders/{self.order.id}/escrow/sync/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], "completed")
+
+    def test_refunded_on_chain_marks_cancelled(self):
+        self.client.force_authenticate(user=self.seller)
+        with patch("core.web3_service.get_escrow_status", return_value=self._chain("refunded")):
+            resp = self.client.post(f"/api/orders/{self.order.id}/escrow/sync/")
+        self.assertEqual(resp.json()["status"], "cancelled")
+
+    def test_open_escrow_leaves_status(self):
+        self.client.force_authenticate(user=self.buyer)
+        with patch("core.web3_service.get_escrow_status", return_value=self._chain("awaiting_delivery")):
+            resp = self.client.post(f"/api/orders/{self.order.id}/escrow/sync/")
+        self.assertEqual(resp.json()["status"], "delivered")
+
+    def test_escrow_of_another_order_is_ignored(self):
+        self.client.force_authenticate(user=self.buyer)
+        other = self._chain("complete", order_id=self.order.id + 999)
+        with patch("core.web3_service.get_escrow_status", return_value=other):
+            resp = self.client.post(f"/api/orders/{self.order.id}/escrow/sync/")
+        self.assertEqual(resp.status_code, 409)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, "delivered")
+
+
+@patch("core.web3_service.get_public_config", return_value=_FAKE_CONFIG)
 class EscrowConfirmEndpointTests(TestCase):
     """Tests for POST /api/orders/<id>/escrow/confirm/"""
 
@@ -518,26 +672,57 @@ class EscrowConfirmEndpointTests(TestCase):
         self.buyer = _make_buyer()
         self.product = _make_product(self.seller)
         self.order = Order.objects.create(
-            buyer=self.buyer,
-            product=self.product,
-            quantity=1,
-            total_price=Decimal("0.5"),
-            escrow_id=0,
+            buyer=self.buyer, product=self.product, quantity=1,
+            total_price=Decimal("0.5"), escrow_id=0,
         )
 
-    @patch("core.web3_service.build_confirm_delivery_tx")
-    def test_returns_unsigned_tx(self, mock_build):
+    @patch("core.web3_service.build_confirm_delivery_call")
+    def test_returns_unsigned_tx(self, mock_build, _cfg):
         mock_build.return_value = {"to": "0xcontract", "data": "0x..."}
         self.client.force_authenticate(user=self.buyer)
         resp = self.client.post(f"/api/orders/{self.order.id}/escrow/confirm/")
         self.assertEqual(resp.status_code, 200)
         self.assertIn("transaction", resp.json())
+        mock_build.assert_called_once_with(0)
 
-    def test_no_escrow_returns_400(self):
+    def test_no_escrow_returns_400(self, _cfg):
         self.order.escrow_id = None
         self.order.save()
         self.client.force_authenticate(user=self.buyer)
         resp = self.client.post(f"/api/orders/{self.order.id}/escrow/confirm/")
+        self.assertEqual(resp.status_code, 400)
+
+
+@patch("core.web3_service.get_public_config", return_value=_FAKE_CONFIG)
+class EscrowRefundEndpointTests(TestCase):
+    """Tests for POST /api/orders/<id>/escrow/refund/"""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.seller = _make_seller()
+        self.buyer = _make_buyer()
+        self.product = _make_product(self.seller)
+        self.order = Order.objects.create(
+            buyer=self.buyer, product=self.product, quantity=1,
+            total_price=Decimal("0.5"), escrow_id=2, status="paid",
+        )
+
+    @patch("core.web3_service.build_refund_call", return_value={"to": "0xc", "data": "0x"})
+    def test_seller_gets_refund_call(self, _b, _cfg):
+        self.client.force_authenticate(user=self.seller)
+        resp = self.client.post(f"/api/orders/{self.order.id}/escrow/refund/")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_buyer_cannot_refund(self, _cfg):
+        self.client.force_authenticate(user=self.buyer)
+        resp = self.client.post(f"/api/orders/{self.order.id}/escrow/refund/")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_funded_order_cannot_be_cancelled_via_status(self, _cfg):
+        self.client.force_authenticate(user=self.seller)
+        resp = self.client.patch(
+            f"/api/orders/{self.order.id}/status/", {"status": "cancelled"}, format="json"
+        )
         self.assertEqual(resp.status_code, 400)
 
 
@@ -550,23 +735,18 @@ class EscrowDisputeEndpointTests(TestCase):
         self.buyer = _make_buyer()
         self.product = _make_product(self.seller)
         self.order = Order.objects.create(
-            buyer=self.buyer,
-            product=self.product,
-            quantity=1,
-            total_price=Decimal("0.5"),
-            escrow_id=0,
+            buyer=self.buyer, product=self.product, quantity=1,
+            total_price=Decimal("0.5"), escrow_id=0,
         )
 
-    @patch("core.web3_service.build_dispute_tx")
-    def test_buyer_can_dispute(self, mock_build):
-        mock_build.return_value = {"to": "0xcontract", "data": "0x..."}
+    @patch("core.web3_service.build_dispute_call", return_value={"to": "0xc", "data": "0x"})
+    def test_buyer_can_dispute(self, _b):
         self.client.force_authenticate(user=self.buyer)
         resp = self.client.post(f"/api/orders/{self.order.id}/escrow/dispute/")
         self.assertEqual(resp.status_code, 200)
 
-    @patch("core.web3_service.build_dispute_tx")
-    def test_seller_can_dispute(self, mock_build):
-        mock_build.return_value = {"to": "0xcontract", "data": "0x..."}
+    @patch("core.web3_service.build_dispute_call", return_value={"to": "0xc", "data": "0x"})
+    def test_seller_can_dispute(self, _b):
         self.client.force_authenticate(user=self.seller)
         resp = self.client.post(f"/api/orders/{self.order.id}/escrow/dispute/")
         self.assertEqual(resp.status_code, 200)
@@ -587,20 +767,15 @@ class EscrowStatusEndpointTests(TestCase):
         self.buyer = _make_buyer()
         self.product = _make_product(self.seller)
         self.order = Order.objects.create(
-            buyer=self.buyer,
-            product=self.product,
-            quantity=1,
-            total_price=Decimal("0.5"),
-            escrow_id=0,
+            buyer=self.buyer, product=self.product, quantity=1,
+            total_price=Decimal("0.5"), escrow_id=0,
         )
 
     @patch("core.web3_service.get_escrow_status")
     def test_returns_on_chain_status(self, mock_status):
         mock_status.return_value = {
-            "buyer": "0xbuyer",
-            "seller": "0xseller",
-            "amount_wei": 500000000000000000,
-            "amount_eth": "0.5",
+            "buyer": "0xbuyer", "seller": "0xseller",
+            "amount_units": 500000, "amount_usdc": "0.50",
             "status": "awaiting_delivery",
         }
         self.client.force_authenticate(user=self.buyer)
@@ -614,6 +789,94 @@ class EscrowStatusEndpointTests(TestCase):
         self.client.force_authenticate(user=self.buyer)
         resp = self.client.get(f"/api/orders/{self.order.id}/escrow/status/")
         self.assertEqual(resp.status_code, 400)
+
+
+class ReleaseExpiredEndpointTests(TestCase):
+    """POST /api/internal/release-expired/ is only callable with CRON_SECRET."""
+
+    URL = "/api/internal/release-expired/"
+
+    def test_rejects_missing_or_wrong_secret(self):
+        with self.settings(CRON_SECRET="s3cret"):
+            self.assertEqual(APIClient().post(self.URL).status_code, 403)
+            resp = APIClient().post(self.URL, HTTP_AUTHORIZATION="Bearer nope")
+            self.assertEqual(resp.status_code, 403)
+
+    def test_disabled_when_secret_unset(self):
+        with self.settings(CRON_SECRET=""):
+            resp = APIClient().post(self.URL, HTTP_AUTHORIZATION="Bearer ")
+            self.assertEqual(resp.status_code, 403)
+
+    @patch("core.escrow_jobs.release_expired_escrows")
+    def test_runs_job_with_correct_secret(self, mock_job):
+        mock_job.return_value = {"released": 1, "synced": 2, "log": [], "errors": []}
+        with self.settings(CRON_SECRET="s3cret"):
+            resp = APIClient().post(self.URL, HTTP_AUTHORIZATION="Bearer s3cret")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"released": 1, "synced": 2, "errors": []})
+
+
+class EscrowDisputeOnChainTests(TestCase):
+    """Opening/resolving disputes moves the on-chain escrow via the arbiter key."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.seller = _make_seller()
+        self.buyer = _make_buyer()
+        self.product = _make_product(self.seller)
+        self.order = Order.objects.create(
+            buyer=self.buyer, product=self.product, quantity=1,
+            total_price=Decimal("580"), escrow_id=9, status="shipped",
+        )
+        self.admin = User.objects.create_superuser(wallet_address=f"0x{'ad' * 20}", password="x")
+
+    def _open(self):
+        self.client.force_authenticate(user=self.buyer)
+        return self.client.post(
+            f"/api/orders/{self.order.id}/dispute/",
+            {"reason": "not_received", "description": "Never arrived"},
+            format="json",
+        )
+
+    @patch("core.web3_service.freeze_escrow_on_chain", return_value="0xfreeze")
+    @patch("core.web3_service.get_escrow_status", return_value={"status": "awaiting_delivery"})
+    def test_open_dispute_freezes_escrow(self, _s, mock_freeze):
+        resp = self._open()
+        self.assertEqual(resp.status_code, 201)
+        mock_freeze.assert_called_once_with(9)
+        self.assertNotIn("warning", resp.json())
+
+    @patch("core.web3_service.freeze_escrow_on_chain", side_effect=ConnectionError("rpc down"))
+    @patch("core.web3_service.get_escrow_status", return_value={"status": "awaiting_delivery"})
+    def test_freeze_failure_is_reported(self, _s, _f):
+        resp = self._open()
+        self.assertEqual(resp.status_code, 201)
+        self.assertIn("warning", resp.json())
+
+    @patch("core.web3_service.resolve_dispute_on_chain", side_effect=ConnectionError("rpc down"))
+    @patch("core.web3_service.get_escrow_status", return_value={"status": "disputed"})
+    @patch("core.web3_service.freeze_escrow_on_chain", return_value="0xfreeze")
+    def test_failed_chain_resolution_keeps_dispute_open(self, _f, _s, _r):
+        dispute_id = self._open().json()["id"]
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.post(
+            f"/api/disputes/{dispute_id}/resolve/", {"resolution": "refund_buyer"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 502)
+        self.assertEqual(Dispute.objects.get(pk=dispute_id).resolution, "pending")
+
+    @patch("core.web3_service.resolve_dispute_on_chain", return_value="0xresolve")
+    @patch("core.web3_service.get_escrow_status", return_value={"status": "disputed"})
+    @patch("core.web3_service.freeze_escrow_on_chain", return_value="0xfreeze")
+    def test_resolution_pays_out_on_chain(self, _f, _s, mock_resolve):
+        dispute_id = self._open().json()["id"]
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.post(
+            f"/api/disputes/{dispute_id}/resolve/", {"resolution": "pay_seller"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 200)
+        mock_resolve.assert_called_once_with(9, refund_buyer=False)
+        self.assertEqual(resp.json()["resolve_tx_hash"], "0xresolve")
 
 
 # ===================================================================

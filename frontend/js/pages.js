@@ -7,16 +7,14 @@ import auth from './auth.js';
 import toast from './toast.js';
 import { navigate, refresh } from './router.js';
 import { observeElements, initCountUp, textReveal } from './animations.js';
-import { createEscrow, confirmDelivery, phpToEthDisplay } from './escrow.js';
+import { createEscrow, confirmDelivery, refundEscrow, phpToUsdcDisplay } from './escrow.js';
+import { API_BASE } from './config.js';
 
-// Resolve relative media URLs to absolute (dev: port 3000 → 8000)
-const API_ORIGIN = window.location.port === '80' || window.location.port === ''
-  ? ''
-  : 'http://localhost:8000';
+// Resolve relative media URLs to absolute. Cloud storage already returns full (signed) URLs.
 function mediaUrl(url) {
   if (!url) return '';
   if (url.startsWith('http')) return url;
-  return API_ORIGIN + url;
+  return API_BASE + url;
 }
 
 // Price formatter — strips trailing zeros
@@ -91,7 +89,7 @@ export async function landingPage(el) {
     <section class="hero">
       <div class="hero-content">
         <h1 class="scroll-reveal">White Market<br>Trading Hub</h1>
-        <p class="scroll-reveal">Buy and sell physical goods, digital products, and game accounts with blockchain-powered escrow protection. Every transaction is secured by smart contracts on Ethereum.</p>
+        <p class="scroll-reveal">Buy and sell physical goods, digital products, and game accounts with blockchain-powered escrow protection. Every payment is held in USDC by a smart contract on Base, with network fees under a peso.</p>
         <div class="hero-actions scroll-reveal">
           <a href="#/products" class="btn btn-primary btn-lg">Explore Marketplace</a>
           ${!auth.isConnected() ? '<button id="hero-connect" class="btn btn-secondary btn-lg">Connect Wallet →</button>' : ''}
@@ -139,7 +137,7 @@ export async function landingPage(el) {
               title:'Connect Your Wallet',
               sub:'No passwords. No accounts. Just your MetaMask.',
               points:[
-                'Install MetaMask and create or import an Ethereum wallet.',
+                'Install MetaMask and create or import a wallet. The site adds the Base network for you.',
                 'Click Connect Wallet — MetaMask signs a one-time challenge message.',
                 'The backend verifies your signature and issues a secure session token.',
                 'Your wallet address becomes your unique identity on the platform.',
@@ -165,7 +163,7 @@ export async function landingPage(el) {
               points:[
                 'Browse verified listings filtered by category, price, or keyword.',
                 'Click Buy Now and select your quantity.',
-                'MetaMask prompts you to send the ETH equivalent of the price to the Escrow smart contract.',
+                'MetaMask asks you to approve and send the USDC equivalent of the price to the Escrow smart contract.',
                 'Funds are locked on-chain — the seller cannot touch them until you confirm receipt.',
               ],
               tag:'Buyers',
@@ -253,7 +251,7 @@ export async function landingPage(el) {
           ${[
             { icon:'lock',          color:'#818cf8', bg:'rgba(99,102,241,0.1)',   title:'Escrow-Protected Payments',   desc:'Buyer funds are locked in a smart contract. The seller only gets paid after you confirm the item arrived as described.' },
             { icon:'user-check',    color:'#34d399', bg:'rgba(52,211,153,0.08)',  title:'Verified Sellers Only',       desc:'Every seller completes government ID verification before posting. No anonymous listings, no fake accounts.' },
-            { icon:'file-check',    color:'#60a5fa', bg:'rgba(96,165,250,0.08)', title:'Immutable Transaction Records', desc:'Every payment is recorded on the Ethereum blockchain — permanently timestamped and tamper-proof.' },
+            { icon:'file-check',    color:'#60a5fa', bg:'rgba(96,165,250,0.08)', title:'Immutable Transaction Records', desc:'Every payment is recorded on Base, an Ethereum layer-2 network — permanently timestamped and tamper-proof.' },
             { icon:'scale',         color:'#f59e0b', bg:'rgba(245,158,11,0.08)', title:'Fair Dispute Arbitration',     desc:'If something goes wrong, an admin reviews evidence from both parties and resolves the case — no guessing, no ghosting.' },
             { icon:'key',           color:'#a78bfa', bg:'rgba(167,139,250,0.1)', title:'No Passwords Stored',          desc:'Authentication is handled entirely by your MetaMask wallet signature. We never store credentials.' },
             { icon:'star',          color:'#fbbf24', bg:'rgba(251,191,36,0.08)', title:'Seller Ratings & Reviews',     desc:'Buyers rate sellers after each completed transaction, building a trustworthy reputation system over time.' },
@@ -1075,7 +1073,7 @@ export async function ordersPage(el) {
           <!-- Price -->
           <div style="text-align:right;flex-shrink:0;">
             <div style="font-weight:800;font-size:1.05rem;color:var(--accent);">₱${formatPrice(o.total_price)}</div>
-            <div style="font-size:0.72rem;color:var(--text-muted);">≈ ${phpToEthDisplay(o.total_price)}</div>
+            <div style="font-size:0.72rem;color:var(--text-muted);">≈ ${phpToUsdcDisplay(o.total_price)}</div>
           </div>
 
           <!-- Status badge -->
@@ -1142,7 +1140,7 @@ export async function orderDetailPage(el, params) {
         <div class="mt-2" style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
           <div><span class="text-muted">Product:</span> ${esc(order.product_title)}</div>
           <div><span class="text-muted">Quantity:</span> ${order.quantity}</div>
-          <div><span class="text-muted">Total:</span> <strong class="product-price">₱${formatPrice(order.total_price)}</strong> <span class="text-muted" style="font-size:0.8rem;">(≈ ${phpToEthDisplay(order.total_price)})</span></div>
+          <div><span class="text-muted">Total:</span> <strong class="product-price">₱${formatPrice(order.total_price)}</strong> <span class="text-muted" style="font-size:0.8rem;">(${order.escrow_id !== null && order.escrow_amount_usdc ? `${order.escrow_amount_usdc} USDC locked` : `≈ ${phpToUsdcDisplay(order.total_price)}`})</span></div>
           <div><span class="text-muted">Created:</span> ${new Date(order.created_at).toLocaleString()}</div>
           <div><span class="text-muted">Buyer:</span> <span style="font-family:var(--font-mono);font-size:0.85rem;">${order.buyer_wallet.slice(0, 10)}...${order.buyer_wallet.slice(-4)}</span></div>
           <div><span class="text-muted">Seller:</span> <span style="font-family:var(--font-mono);font-size:0.85rem;">${order.seller_wallet.slice(0, 10)}...${order.seller_wallet.slice(-4)}</span></div>
@@ -1160,9 +1158,11 @@ export async function orderDetailPage(el, params) {
   const actions = [];
 
   if (isBuyer && order.status === 'pending')
-    actions.push(`<button class="btn btn-primary" data-action="pay"><i data-lucide="credit-card" style="width:16px;height:16px;vertical-align:middle;margin-right:6px;"></i>Pay with MetaMask (${phpToEthDisplay(order.total_price)})</button>`);
+    actions.push(`<button class="btn btn-primary" data-action="pay"><i data-lucide="credit-card" style="width:16px;height:16px;vertical-align:middle;margin-right:6px;"></i>Pay with USDC (≈ ${phpToUsdcDisplay(order.total_price)})</button>`);
   if (isSeller && order.status === 'paid')
     actions.push('<button class="btn btn-primary" data-action="ship"><i data-lucide="package" style="width:16px;height:16px;vertical-align:middle;margin-right:6px;"></i>Mark as Shipped</button>');
+  if (isSeller && order.status === 'paid' && order.escrow_id !== null)
+    actions.push('<button class="btn btn-secondary" data-action="refund"><i data-lucide="undo-2" style="width:16px;height:16px;vertical-align:middle;margin-right:6px;"></i>Refund & Cancel</button>');
   if (isBuyer && order.status === 'shipped')
     actions.push('<button class="btn btn-success" data-action="deliver"><i data-lucide="check-circle" style="width:16px;height:16px;vertical-align:middle;margin-right:6px;"></i>Confirm Delivery</button>');
   if (isBuyer && order.status === 'delivered') {
@@ -1193,13 +1193,13 @@ export async function orderDetailPage(el, params) {
       if (action === 'pay') {
         // Blockchain: create escrow via MetaMask
         btn.textContent = 'Waiting for MetaMask...';
-        const { txHash, escrowId } = await createEscrow(order.id, order.total_price);
+        const { txHash, escrowId, amountUsdc } = await createEscrow(order.id);
         showSuccessModal({
           title: 'Payment Sent!',
-          subtitle: 'Your funds have been locked in the smart contract escrow. The seller will now ship your order.',
+          subtitle: 'Your USDC is locked in the escrow contract. The seller will now ship your order.',
           details: [
             { label: 'Order', value: `#${order.id}` },
-            { label: 'Amount', value: `₱${formatPrice(order.total_price)} (${phpToEthDisplay(order.total_price)})` },
+            { label: 'Amount', value: `₱${formatPrice(order.total_price)} (${amountUsdc} USDC)` },
             { label: 'Escrow ID', value: `${escrowId}` },
             { label: 'TX Hash', value: `${txHash.slice(0, 18)}...` },
           ],
@@ -1217,7 +1217,7 @@ export async function orderDetailPage(el, params) {
           details: [
             { label: 'Order', value: `#${order.id}` },
             { label: 'Product', value: order.product_title },
-            { label: 'Amount', value: `₱${formatPrice(order.total_price)} (${phpToEthDisplay(order.total_price)})` },
+            { label: 'Amount', value: `₱${formatPrice(order.total_price)}${order.escrow_amount_usdc ? ` (${order.escrow_amount_usdc} USDC)` : ''}` },
             { label: 'TX Hash', value: `${txHash.slice(0, 18)}...` },
             { label: 'Status', value: 'COMPLETED ✓' },
           ],
@@ -1225,6 +1225,14 @@ export async function orderDetailPage(el, params) {
           onClose: () => navigate(`/orders/${order.id}`),
         });
         return; // Don't navigate yet — let user close modal
+      } else if (action === 'refund') {
+        if (!confirm('Refund the buyer in full and cancel this order?')) {
+          btn.disabled = false;
+          return;
+        }
+        btn.textContent = 'Refunding on-chain...';
+        await refundEscrow(order.id);
+        toast.success('Buyer refunded. Order cancelled.');
       } else {
         // Non-blockchain actions (ship, deliver)
         const statusMap = { ship: 'shipped', deliver: 'delivered' };

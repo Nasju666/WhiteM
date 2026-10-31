@@ -59,3 +59,5 @@ setup.txt
 # ─── Local-only docs (not pushed) ─────────────────────────────────────────────
 SETUP.md
 MAINNET_DEPLOYMENT.md
+BASE_DEPLOYMENT.md
+PUBLISHING.md

@@ -253,6 +253,19 @@ class Order(models.Model):
         default="",
         help_text="Transaction hash of the escrow deposit.",
     )
+    escrow_amount_units = models.BigIntegerField(
+        null=True,
+        blank=True,
+        help_text="Quoted escrow amount in USDC base units (6 decimals).",
+    )
+    escrow_php_rate = models.DecimalField(
+        max_digits=12,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        help_text="PHP per 1 USDC used for the quote.",
+    )
+    escrow_quoted_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

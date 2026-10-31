@@ -33,7 +33,12 @@ urlpatterns = [
     path("api/orders/<int:pk>/status/", views.OrderStatusView.as_view(), name="order-status"),
 
     # Escrow (Web3)
+    path("api/escrow/config/", views.EscrowConfigView.as_view(), name="escrow-config"),
+    path("api/internal/release-expired/", views.ReleaseExpiredEscrowsView.as_view(), name="escrow-release-expired"),
     path("api/orders/<int:pk>/escrow/create/", views.EscrowCreateView.as_view(), name="escrow-create"),
+    path("api/orders/<int:pk>/escrow/verify/", views.EscrowVerifyView.as_view(), name="escrow-verify"),
+    path("api/orders/<int:pk>/escrow/sync/", views.EscrowSyncView.as_view(), name="escrow-sync"),
+    path("api/orders/<int:pk>/escrow/refund/", views.EscrowRefundView.as_view(), name="escrow-refund"),
     path("api/orders/<int:pk>/escrow/confirm/", views.EscrowConfirmView.as_view(), name="escrow-confirm"),
     path("api/orders/<int:pk>/escrow/dispute/", views.EscrowDisputeView.as_view(), name="escrow-dispute"),
     path("api/orders/<int:pk>/escrow/status/", views.EscrowStatusView.as_view(), name="escrow-status"),

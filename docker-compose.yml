@@ -35,7 +35,14 @@ services:
       - ALLOWED_HOSTS=localhost,127.0.0.1,backend
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost,http://localhost:3000}
       - WEB3_PROVIDER_URL=${WEB3_PROVIDER_URL:-http://hardhat:8545}
+      - PUBLIC_RPC_URL=${PUBLIC_RPC_URL:-}
+      - CHAIN_ID=${CHAIN_ID:-31337}
       - ESCROW_CONTRACT_ADDRESS=${ESCROW_CONTRACT_ADDRESS:-}
+      - USDC_TOKEN_ADDRESS=${USDC_TOKEN_ADDRESS:-}
+      - ARBITER_PRIVATE_KEY=${ARBITER_PRIVATE_KEY:-}
+      - PRICE_FEED=${PRICE_FEED:-coingecko}
+      - PHP_PER_USDC=${PHP_PER_USDC:-}
+      - COINGECKO_API_KEY=${COINGECKO_API_KEY:-}
     volumes:
       - static_files:/app/staticfiles
       - media_files:/app/media

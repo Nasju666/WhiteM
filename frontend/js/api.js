@@ -2,11 +2,7 @@
    api.js — Axios-like fetch wrapper with JWT interceptor
    ============================================================ */
 
-// When served through Nginx (port 80), API is on same origin.
-// In dev (port 3000), API is on localhost:8000.
-const API_BASE = window.location.port === '80' || window.location.port === ''
-  ? ''
-  : 'http://localhost:8000';
+import { API_BASE } from './config.js';
 
 class ApiClient {
   constructor() {

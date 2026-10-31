@@ -126,9 +126,16 @@ class OrderSerializer(serializers.ModelSerializer):
         source="product.seller.wallet_address", read_only=True
     )
     has_review = serializers.SerializerMethodField()
+    escrow_amount_usdc = serializers.SerializerMethodField()
 
     def get_has_review(self, obj):
         return hasattr(obj, "review")
+
+    def get_escrow_amount_usdc(self, obj):
+        if obj.escrow_amount_units is None:
+            return None
+        from decimal import Decimal
+        return str((Decimal(obj.escrow_amount_units) / Decimal(10**6)).quantize(Decimal("0.01")))
 
     class Meta:
         model = Order
@@ -145,6 +152,9 @@ class OrderSerializer(serializers.ModelSerializer):
             "tracking_number",
             "escrow_id",
             "tx_hash",
+            "escrow_amount_units",
+            "escrow_amount_usdc",
+            "escrow_php_rate",
             "has_review",
             "created_at",
             "updated_at",
@@ -159,6 +169,8 @@ class OrderSerializer(serializers.ModelSerializer):
             "tracking_number",
             "escrow_id",
             "tx_hash",
+            "escrow_amount_units",
+            "escrow_php_rate",
             "created_at",
             "updated_at",
         ]
@@ -187,10 +199,10 @@ class OrderSerializer(serializers.ModelSerializer):
 class OrderStatusSerializer(serializers.Serializer):
     """Validates an order status transition."""
 
+    # Payment-related fields (escrow_id, tx_hash) are set only by the escrow
+    # verify endpoint after an on-chain check, never by the client.
     status = serializers.ChoiceField(choices=Order.Status.choices)
     tracking_number = serializers.CharField(required=False, allow_blank=True)
-    tx_hash = serializers.CharField(required=False, allow_blank=True)
-    escrow_id = serializers.IntegerField(required=False, allow_null=True)
 
 
 # ---------------------------------------------------------------------------
